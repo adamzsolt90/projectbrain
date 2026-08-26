@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -16,6 +17,17 @@ type Profile = {
   protectedPaths: string[];
   securityRules: string[];
   autonomyRules: string[];
+  versions: string[];
+  configurations: string[];
+};
+
+type JsonObject = Record<string, unknown>;
+
+type GenerationManifest = {
+  version: 1;
+  tools: AiTool[];
+  inputHash: string;
+  outputs: Record<string, string>;
 };
 
 type Finding = {
@@ -48,6 +60,43 @@ function read(relative: string): string {
   } catch {
     return "";
   }
+}
+
+function readJson(relative: string): JsonObject {
+  try {
+    const value: unknown = JSON.parse(read(relative));
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : {};
+  } catch {
+    return {};
+  }
+}
+
+function objectValue(value: unknown): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function yamlScalars(contents: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const line of contents.split("\n")) {
+    const match = line.match(/^([A-Za-z][\w-]*):\s*(.*?)\s*(?:#.*)?$/);
+    if (!match || !match[2]) continue;
+    values[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
+  }
+  return values;
+}
+
+function dependencyVersion(source: JsonObject, packageName: string): string | undefined {
+  const packages = Array.isArray(source.packages) ? source.packages : [];
+  const development = Array.isArray(source["packages-dev"]) ? source["packages-dev"] : [];
+  for (const entry of [...packages, ...development]) {
+    const dependency = objectValue(entry);
+    if (dependency.name === packageName) return stringValue(dependency.version)?.replace(/^v/, "");
+  }
+  return undefined;
 }
 
 function addUnique(list: string[], value: string): void {
@@ -91,38 +140,74 @@ function detect(): Profile {
       "Only stop and ask when a decision is irreversible, destructive, requires credentials, or depends on information that exists nowhere in the project.",
       "When you must ask, state your assumption, proceed on it if safe, and report it instead of waiting.",
       "Report what you did, what you ran, and the result. Do not ask the user to confirm each intermediate step."
-    ]
+    ],
+    versions: [],
+    configurations: []
   };
 
   const composer = read("composer.json");
-  const packageJson = read("package.json");
+  const composerJson = readJson("composer.json");
+  const composerLock = readJson("composer.lock");
+  const packageJsonContents = read("package.json");
+  const packageJson = readJson("package.json");
+  const composerDependencies = {
+    ...objectValue(composerJson.require),
+    ...objectValue(composerJson["require-dev"])
+  };
+  const nodeDependencies = {
+    ...objectValue(packageJson.dependencies),
+    ...objectValue(packageJson.devDependencies)
+  };
 
   if (composer) {
     addUnique(profile.languages, "PHP");
     addUnique(profile.tools, "Composer");
     addUnique(profile.packageManagers, "Composer");
+    const phpVersion = stringValue(composerDependencies.php);
+    if (phpVersion) addUnique(profile.versions, `PHP ${phpVersion}`);
+    for (const [name, script] of Object.entries(objectValue(composerJson.scripts))) {
+      const values = Array.isArray(script) ? script : [script];
+      if (values.some(value => typeof value === "string" && value.includes("drush"))) {
+        addUnique(profile.commands, `composer ${name}`);
+      }
+    }
   }
 
-  if (packageJson) {
+  if (packageJsonContents) {
     addUnique(profile.languages, "JavaScript");
     addUnique(profile.tools, "Node.js");
-    addUnique(profile.packageManagers, "npm");
+    const packageManager = stringValue(packageJson.packageManager)?.split("@")[0];
+    addUnique(profile.packageManagers, packageManager || "npm");
+    const engines = objectValue(packageJson.engines);
+    const nodeVersion = stringValue(engines.node);
+    if (nodeVersion) addUnique(profile.versions, `Node.js ${nodeVersion}`);
+    for (const name of Object.keys(objectValue(packageJson.scripts))) {
+      addUnique(profile.commands, `${packageManager || "npm"} run ${name}`);
+    }
   }
 
-  if (exists("tsconfig.json")) {
-    addUnique(profile.languages, "TypeScript");
-  }
-
-  if (exists(".git")) {
-    addUnique(profile.tools, "Git");
-  }
+  if (exists("tsconfig.json")) addUnique(profile.languages, "TypeScript");
+  if (exists(".git")) addUnique(profile.tools, "Git");
 
   // Environment detection.
-  if (exists(".ddev")) {
+  const ddevContents = read(".ddev/config.yaml");
+  if (ddevContents || exists(".ddev")) {
     addUnique(profile.environments, "DDEV");
     addUnique(profile.commands, "ddev start");
     addUnique(profile.commands, "ddev describe");
     addUnique(profile.commands, "ddev ssh");
+    if (ddevContents) {
+      addUnique(profile.configurations, ".ddev/config.yaml");
+      const ddev = yamlScalars(ddevContents);
+      for (const key of ["name", "type", "docroot", "php_version", "webserver_type", "database"]) {
+        if (ddev[key]) addUnique(profile.versions, `DDEV ${key}: ${ddev[key]}`);
+      }
+    }
+    try {
+      for (const name of fs.readdirSync(path.join(root, ".ddev", "commands", "web"))) {
+        if (!name.startsWith(".")) addUnique(profile.commands, `ddev ${name}`);
+      }
+    } catch {}
   }
 
   if (
@@ -138,23 +223,26 @@ function detect(): Profile {
   }
 
   // Drupal detection.
-  const isDrupal =
-    composer.includes("drupal/core") ||
-    composer.includes("drupal/core-recommended") ||
-    exists("core/lib/Drupal.php") ||
-    exists("web/core/lib/Drupal.php");
+  const drupalPackage = composerDependencies["drupal/core-recommended"]
+    ? "drupal/core-recommended"
+    : composerDependencies["drupal/core"]
+      ? "drupal/core"
+      : undefined;
+  const isDrupal = Boolean(drupalPackage || exists("core/lib/Drupal.php") || exists("web/core/lib/Drupal.php"));
+  const drupalVersion =
+    dependencyVersion(composerLock, "drupal/core") ||
+    dependencyVersion(composerLock, "drupal/core-recommended") ||
+    (drupalPackage ? stringValue(composerDependencies[drupalPackage]) : undefined);
 
   if (isDrupal) {
-    addUnique(profile.frameworks, "Drupal");
-    addUnique(profile.tools, "Drush");
-
+    addUnique(profile.frameworks, drupalVersion ? `Drupal ${drupalVersion}` : "Drupal");
+    if (drupalVersion) addUnique(profile.versions, `Drupal ${drupalVersion}`);
     profile.securityRules.push(
       "Use Drupal's database API with placeholders instead of raw SQL strings.",
       "Render user data through the render system or Twig auto-escaping; avoid #markup with raw input.",
       "Check permissions and access via route requirements or access handlers, not ad hoc logic.",
       "Validate and sanitize form input in form validation handlers."
     );
-
     profile.rules.push(
       "Follow Drupal coding standards.",
       "Prefer dependency injection over static service access.",
@@ -163,20 +251,25 @@ function detect(): Profile {
       "Respect cacheability metadata where applicable.",
       "Use configuration management for deployable configuration."
     );
-
     profile.protectedPaths.push("core/", "web/core/");
-
-    if (profile.environments.includes("DDEV")) {
-      addUnique(profile.commands, "ddev drush cr");
-      addUnique(profile.commands, "ddev drush status");
-      addUnique(profile.commands, "ddev composer install");
-    } else {
-      addUnique(profile.commands, "vendor/bin/drush cr");
-    }
   }
 
+  const drushConstraint = stringValue(composerDependencies["drush/drush"]);
+  const drushVersion = dependencyVersion(composerLock, "drush/drush") || drushConstraint;
+  if (drushVersion || exists("vendor/bin/drush")) {
+    addUnique(profile.tools, drushVersion ? `Drush ${drushVersion}` : "Drush");
+    if (drushVersion) addUnique(profile.versions, `Drush ${drushVersion}`);
+    const prefix = profile.environments.includes("DDEV") ? "ddev drush" : "vendor/bin/drush";
+    addUnique(profile.commands, `${prefix} status`);
+    addUnique(profile.commands, `${prefix} cr`);
+    addUnique(profile.commands, `${prefix} updatedb`);
+    addUnique(profile.commands, `${prefix} config:export`);
+    addUnique(profile.commands, `${prefix} config:import`);
+  }
+  if (isDrupal && profile.environments.includes("DDEV")) addUnique(profile.commands, "ddev composer install");
+
   // Laravel detection.
-  if (exists("artisan") || composer.includes("laravel/framework")) {
+  if (exists("artisan") || composerDependencies["laravel/framework"]) {
     addUnique(profile.frameworks, "Laravel");
     profile.rules.push(
       "Follow existing Laravel conventions.",
@@ -188,42 +281,27 @@ function detect(): Profile {
   }
 
   // PHP quality tooling.
-  if (exists("phpstan.neon") || exists("phpstan.neon.dist")) {
-    addUnique(profile.tools, "PHPStan");
-    addUnique(profile.commands, "vendor/bin/phpstan analyse");
-  }
-
-  if (
-    exists("phpcs.xml") ||
-    exists("phpcs.xml.dist") ||
-    exists(".phpcs.xml") ||
-    exists(".phpcs.xml.dist")
-  ) {
-    addUnique(profile.tools, "PHP_CodeSniffer");
-    addUnique(profile.commands, "vendor/bin/phpcs");
-  }
-
-  if (exists("phpunit.xml") || exists("phpunit.xml.dist")) {
-    addUnique(profile.tools, "PHPUnit");
-    addUnique(profile.commands, "vendor/bin/phpunit");
+  const qualityTools = [
+    { name: "PHPStan", package: "phpstan/phpstan", files: ["phpstan.neon", "phpstan.neon.dist"], command: "vendor/bin/phpstan analyse" },
+    { name: "PHP_CodeSniffer", package: "squizlabs/php_codesniffer", files: ["phpcs.xml", "phpcs.xml.dist", ".phpcs.xml", ".phpcs.xml.dist"], command: "vendor/bin/phpcs" },
+    { name: "PHPUnit", package: "phpunit/phpunit", files: ["phpunit.xml", "phpunit.xml.dist"], command: "vendor/bin/phpunit" }
+  ];
+  for (const tool of qualityTools) {
+    const configuration = tool.files.find(file => exists(file));
+    const version = dependencyVersion(composerLock, tool.package) || stringValue(composerDependencies[tool.package]);
+    if (!configuration && !version) continue;
+    addUnique(profile.tools, version ? `${tool.name} ${version}` : tool.name);
+    if (version) addUnique(profile.versions, `${tool.name} ${version}`);
+    if (configuration) addUnique(profile.configurations, configuration);
+    addUnique(profile.commands, tool.command);
   }
 
   // Node ecosystem.
   if (exists("package-lock.json")) addUnique(profile.packageManagers, "npm");
   if (exists("pnpm-lock.yaml")) addUnique(profile.packageManagers, "pnpm");
   if (exists("yarn.lock")) addUnique(profile.packageManagers, "Yarn");
-
-  if (packageJson.includes('"next"')) {
-    addUnique(profile.frameworks, "Next.js");
-  }
-  if (packageJson.includes('"vite"')) {
-    addUnique(profile.tools, "Vite");
-  }
-
-  if (packageJson) {
-    addUnique(profile.commands, "npm run build");
-    addUnique(profile.commands, "npm test");
-  }
+  if (nodeDependencies.next) addUnique(profile.frameworks, `Next.js ${String(nodeDependencies.next)}`);
+  if (nodeDependencies.vite) addUnique(profile.tools, `Vite ${String(nodeDependencies.vite)}`);
 
   return profile;
 }
@@ -276,6 +354,14 @@ ${list(profile.tools)}
 ## Package Managers
 
 ${list(profile.packageManagers)}
+
+## Detected Versions
+
+${list(profile.versions)}
+
+## Detected Configuration
+
+${list(profile.configurations)}
 
 ## General Coding Rules
 
@@ -377,7 +463,12 @@ violated. Detected issues in the existing codebase are listed in \`.ai/security-
 }
 
 function cursorContext(profile: Profile): string {
-  return `# Project Rules
+  return `---
+description: ProjectBrain detected project rules
+alwaysApply: true
+---
+
+# Project Rules
 
 ${rules(profile)}
 
@@ -694,6 +785,77 @@ async function selectTools(): Promise<AiTool[]> {
   }
 }
 
+const CONTEXT_INPUTS = [
+  ".ddev/config.yaml",
+  "composer.json",
+  "composer.lock",
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "tsconfig.json",
+  "phpstan.neon",
+  "phpstan.neon.dist",
+  "phpcs.xml",
+  "phpcs.xml.dist",
+  ".phpcs.xml",
+  ".phpcs.xml.dist",
+  "phpunit.xml",
+  "phpunit.xml.dist"
+];
+
+function hash(value: string | Buffer): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function inputHash(): string {
+  const inputs = CONTEXT_INPUTS.filter(exists)
+    .map(file => `${file}\0${read(file)}`)
+    .join("\0");
+  return hash(`${inputs}\0${JSON.stringify(detect())}`);
+}
+
+function outputHashes(files: string[]): Record<string, string> {
+  return Object.fromEntries(
+    files.map(file => [path.relative(root, file), hash(fs.readFileSync(file))])
+  );
+}
+
+function readManifest(): GenerationManifest | undefined {
+  try {
+    return JSON.parse(read(".ai/projectbrain.json")) as GenerationManifest;
+  } catch {
+    return undefined;
+  }
+}
+
+function checkContext(): boolean {
+  const manifest = readManifest();
+  if (!manifest || manifest.version !== 1 || !Array.isArray(manifest.tools)) {
+    console.error("ProjectBrain context has not been generated. Run projectbrain init.");
+    return false;
+  }
+
+  const problems: string[] = [];
+  if (manifest.inputHash !== inputHash()) problems.push("Project configuration changed since generation.");
+  for (const [relative, expectedHash] of Object.entries(manifest.outputs)) {
+    if (!exists(relative)) problems.push(`Generated file is missing: ${relative}`);
+    else if (hash(fs.readFileSync(path.join(root, relative))) !== expectedHash) {
+      problems.push(`Generated file was modified: ${relative}`);
+    }
+  }
+
+  if (problems.length) {
+    console.error("ProjectBrain context drift detected:");
+    for (const problem of problems) console.error(`  - ${problem}`);
+    console.error(`Run projectbrain update --tool=${manifest.tools.length === AI_TOOLS.length ? "all" : manifest.tools[0]}.`);
+    return false;
+  }
+
+  console.log("ProjectBrain context is current.");
+  return true;
+}
+
 function writeOutput(profile: Profile, selectedTools: AiTool[]): void {
   const outputDir = path.join(root, ".ai");
   fs.mkdirSync(outputDir, { recursive: true });
@@ -731,6 +893,16 @@ function writeOutput(profile: Profile, selectedTools: AiTool[]): void {
   fs.writeFileSync(reportFile, securityReport(profile, findings));
   generatedFiles.push(reportFile);
 
+  const manifest: GenerationManifest = {
+    version: 1,
+    tools: selectedTools,
+    inputHash: inputHash(),
+    outputs: outputHashes(generatedFiles)
+  };
+  const manifestFile = path.join(outputDir, "projectbrain.json");
+  fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+  generatedFiles.push(manifestFile);
+
   console.log("ProjectBrain analysis complete.");
   console.log("Generated:");
   for (const file of generatedFiles) console.log(`  ${path.relative(root, file)}`);
@@ -755,6 +927,9 @@ switch (command) {
   case "scan":
   case "update":
     writeOutput(detect(), await selectTools());
+    break;
+  case "check":
+    process.exitCode = checkContext() ? 0 : 1;
     break;
   case "security": {
     const findings = scanSecurity();
@@ -781,6 +956,7 @@ switch (command) {
     console.log("  init   Analyze project and generate context");
     console.log("  scan   Analyze project and generate context");
     console.log("  update Regenerate context");
+    console.log("  check  Check generated context for drift");
     console.log("  security Scan source for security issues only");
 
     process.exit(command ? 1 : 0);
