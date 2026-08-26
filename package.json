@@ -1,0 +1,17 @@
+{
+  "name": "projectbrain",
+  "version": "0.1.0",
+  "description": "Local-first project environment and AI agent context detector",
+  "type": "module",
+  "bin": {
+    "projectbrain": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
